@@ -1,0 +1,35 @@
+name: Earthquake Monitor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run earthquake monitor
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASSIGNEE_EMAIL: ${{ secrets.ASSIGNEE_EMAIL }}
+          PROJECT_GID: ${{ secrets.PROJECT_GID }}
+          SECTION_GID: ${{ secrets.SECTION_GID }}
+        run: python earthquake_monitor.py
+
+      - name: Save seen earthquakes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_earthquakes.json
+          git diff --staged --quiet || git commit -m "Update seen earthquakes"
+          git push

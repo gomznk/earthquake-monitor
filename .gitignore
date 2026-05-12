@@ -1,0 +1,5 @@
+*.log
+__pycache__/
+CLAUDE.md
+earthquake_monitor_memo.md
+.claude/
