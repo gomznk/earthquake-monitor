@@ -6,6 +6,8 @@ tenki.jp の震度4以上の地震一覧を監視し、新規地震をAsanaプ�
 """
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import json
 import os
@@ -13,21 +15,7 @@ import re
 import sys
 
 # ── 設定 ──────────────────────────────────────────────
-def _get_asana_token() -> str:
-    return os.environ["ASANA_TOKEN"]
-
-
-def _get_assignee_gid() -> str:
-    res = requests.get(
-        f"https://app.asana.com/api/1.0/users/{ASSIGNEE_EMAIL}",
-        headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Accept": "application/json"},
-        timeout=15,
-    )
-    res.raise_for_status()
-    return res.json()["data"]["gid"]
-
-
-ASANA_TOKEN = _get_asana_token()
+ASANA_TOKEN = os.environ["ASANA_TOKEN"]
 PROJECT_GID = os.environ["PROJECT_GID"]
 SECTION_GID = os.environ["SECTION_GID"]
 ASSIGNEE_EMAIL = os.environ["ASSIGNEE_EMAIL"]
@@ -35,7 +23,28 @@ CUTOFF_DATE = "2026-04-01"
 EARTHQUAKE_URL = "https://earthquake.tenki.jp/bousai/earthquake/entries/level-4/"
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_earthquakes.json")
 BASE_URL = "https://earthquake.tenki.jp"
-ASSIGNEE_GID = _get_assignee_gid()
+TIMEOUT = 30
+
+
+def _build_session() -> requests.Session:
+    """GETのみ自動リトライするセッション。
+
+    POSTはリトライ対象外にしている。タスク作成POSTがタイムアウトした場合、
+    Asana側では作成成功している可能性があり、再送すると重複タスクになるため。
+    POSTの失敗は呼び出し側で捕捉し、次回の実行で拾い直す。
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,  # 1秒 → 2秒 → 4秒
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+SESSION = _build_session()
 
 # 長いキーが短いキーに部分一致するのを防ぐため、文字列長の降順で定義する
 INTENSITY_MAP = {
@@ -49,6 +58,25 @@ INTENSITY_MAP = {
     "level_2":       "震度2",
     "level_1":       "震度1",
 }
+
+
+def is_transient(e: Exception) -> bool:
+    """一時的な通信エラー（Asana/tenki.jp側の瞬断）かどうか"""
+    if isinstance(e, (requests.Timeout, requests.ConnectionError, requests.exceptions.RetryError)):
+        return True
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return e.response.status_code == 429 or e.response.status_code >= 500
+    return False
+
+
+def get_assignee_gid() -> str:
+    res = SESSION.get(
+        f"https://app.asana.com/api/1.0/users/{ASSIGNEE_EMAIL}",
+        headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Accept": "application/json"},
+        timeout=TIMEOUT,
+    )
+    res.raise_for_status()
+    return res.json()["data"]["gid"]
 
 
 def load_seen():
@@ -76,7 +104,7 @@ def parse_intensity(img_src):
 
 def fetch_earthquakes():
     headers = {"User-Agent": "Mozilla/5.0 (compatible; EarthquakeMonitor/1.0)"}
-    res = requests.get(EARTHQUAKE_URL, headers=headers, timeout=15)
+    res = SESSION.get(EARTHQUAKE_URL, headers=headers, timeout=TIMEOUT)
     res.raise_for_status()
     res.encoding = "utf-8"
     soup = BeautifulSoup(res.text, "html.parser")
@@ -139,7 +167,7 @@ def fetch_earthquakes():
     return earthquakes
 
 
-def post_to_asana(eq):
+def post_to_asana(eq, assignee_gid):
     name = f"【地震情報】{eq['intensity']} {eq['location']}"
     notes = (
         f"発生時刻　: {eq['time']}\n"
@@ -156,27 +184,27 @@ def post_to_asana(eq):
     }
 
     # タスク作成
-    res = requests.post(
+    res = SESSION.post(
         "https://app.asana.com/api/1.0/tasks",
         headers=headers,
         json={"data": {
             "name":     name,
             "notes":    notes,
             "projects": [PROJECT_GID],
-            "assignee": ASSIGNEE_GID,
+            "assignee": assignee_gid,
             "due_on":   eq["date"],
         }},
-        timeout=15,
+        timeout=TIMEOUT,
     )
     res.raise_for_status()
     task_gid = res.json()["data"]["gid"]
 
     # セクションに追加
-    requests.post(
+    SESSION.post(
         f"https://app.asana.com/api/1.0/sections/{SECTION_GID}/addTask",
         headers=headers,
         json={"data": {"task": task_gid}},
-        timeout=15,
+        timeout=TIMEOUT,
     ).raise_for_status()
 
     print(f"[OK] Asanaに投稿: {eq['time']} {eq['location']} {eq['intensity']}")
@@ -185,9 +213,22 @@ def post_to_asana(eq):
 def main():
     seen = load_seen()
 
+    # 担当者GIDの取得（Asanaの一時的な不調なら次回の実行で拾い直すため正常終了する）
+    try:
+        assignee_gid = get_assignee_gid()
+    except Exception as e:
+        if is_transient(e):
+            print(f"[WARN] Asanaが一時的に応答しないため今回はスキップ: {e}", file=sys.stderr)
+            return
+        print(f"[ERROR] 担当者GIDの取得に失敗: {e}", file=sys.stderr)
+        sys.exit(1)
+
     try:
         earthquakes = fetch_earthquakes()
     except Exception as e:
+        if is_transient(e):
+            print(f"[WARN] ページ取得が一時的に失敗したため今回はスキップ: {e}", file=sys.stderr)
+            return
         print(f"[ERROR] ページ取得失敗: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -197,10 +238,11 @@ def main():
     for eq in earthquakes:
         if eq["id"] not in seen:
             try:
-                post_to_asana(eq)
+                post_to_asana(eq, assignee_gid)
                 new_seen.add(eq["id"])
                 posted += 1
             except Exception as e:
+                # 投稿できなかった地震はseenに入れないので、次回の実行で再投稿される
                 print(f"[ERROR] Asana投稿失敗 ({eq['id']}): {e}", file=sys.stderr)
 
     save_seen(new_seen)
