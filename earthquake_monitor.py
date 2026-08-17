@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 
 # ── 設定 ──────────────────────────────────────────────
 ASANA_TOKEN = os.environ["ASANA_TOKEN"]
@@ -22,8 +23,12 @@ ASSIGNEE_EMAIL = os.environ["ASSIGNEE_EMAIL"]
 CUTOFF_DATE = "2026-04-01"
 EARTHQUAKE_URL = "https://earthquake.tenki.jp/bousai/earthquake/entries/level-4/"
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_earthquakes.json")
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "failure_state.json")
 BASE_URL = "https://earthquake.tenki.jp"
 TIMEOUT = 30
+# 一時エラーが何回連続したらワークフローを失敗させるか。
+# 10分間隔で実行しているため6回連続 ≒ 1時間復旧していない状態を意味する。
+ALERT_THRESHOLD = 6
 
 
 def _build_session() -> requests.Session:
@@ -67,6 +72,53 @@ def is_transient(e: Exception) -> bool:
     if isinstance(e, requests.HTTPError) and e.response is not None:
         return e.response.status_code == 429 or e.response.status_code >= 500
     return False
+
+
+def load_failure_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def clear_failure_state() -> None:
+    """巡回が成功したので連続失敗の記録を消す"""
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+        print("[INFO] 連続失敗の記録をリセットしました")
+
+
+def record_transient_failure(where: str, e: Exception) -> None:
+    """一時エラーを記録し、連続しすぎている場合はワークフローを失敗させる。
+
+    単発の瞬断では緑のまま終わらせるが、復旧しないまま ALERT_THRESHOLD 回
+    連続したら通知する。以降も同じ間隔（≒1時間ごと）でのみ通知し、
+    10分おきにメールが飛び続けないようにしている。
+    """
+    state = load_failure_state()
+    count = int(state.get("consecutive_failures", 0) or 0) + 1
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({
+            "consecutive_failures": count,
+            "first_failed_at": state.get("first_failed_at") or now,
+            "last_failed_at": now,
+            "last_error": f"{where}: {type(e).__name__}: {e}",
+        }, f, ensure_ascii=False, indent=2)
+
+    print(f"[WARN] {where}が一時的に失敗（{count}回連続）: {e}", file=sys.stderr)
+
+    if count >= ALERT_THRESHOLD and count % ALERT_THRESHOLD == 0:
+        since = state.get("first_failed_at") or now
+        print(
+            f"[ERROR] {since} から {count}回連続で失敗しています。障害が継続している可能性があります。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def get_assignee_gid() -> str:
@@ -218,7 +270,7 @@ def main():
         assignee_gid = get_assignee_gid()
     except Exception as e:
         if is_transient(e):
-            print(f"[WARN] Asanaが一時的に応答しないため今回はスキップ: {e}", file=sys.stderr)
+            record_transient_failure("Asanaへの接続", e)
             return
         print(f"[ERROR] 担当者GIDの取得に失敗: {e}", file=sys.stderr)
         sys.exit(1)
@@ -227,7 +279,7 @@ def main():
         earthquakes = fetch_earthquakes()
     except Exception as e:
         if is_transient(e):
-            print(f"[WARN] ページ取得が一時的に失敗したため今回はスキップ: {e}", file=sys.stderr)
+            record_transient_failure("tenki.jpの取得", e)
             return
         print(f"[ERROR] ページ取得失敗: {e}", file=sys.stderr)
         sys.exit(1)
@@ -246,6 +298,7 @@ def main():
                 print(f"[ERROR] Asana投稿失敗 ({eq['id']}): {e}", file=sys.stderr)
 
     save_seen(new_seen)
+    clear_failure_state()
 
     if posted == 0:
         print("[INFO] 新規地震なし")
